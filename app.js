@@ -131,6 +131,43 @@ app.get('/api/check-regenerated-images/:sessionId', (req, res) => {
     sessions.set(sessionId, sessionData);
 });
 
+// NEW ROUTE: BrandVoice user check proxy to n8n
+app.post('/api/check-user', async (req, res) => {
+    try {
+        const { email } = req.body;
+        
+        if (!email) {
+            return res.status(400).json({ error: 'Email is required' });
+        }
+        
+        console.log(`Checking user in Airtable for email: ${email}`);
+        
+        // Import fetch if Node.js version < 18
+        const fetch = (...args) => import('node-fetch').then(({default: fetch}) => fetch(...args));
+        
+        // Forward to n8n webhook
+        const response = await fetch('https://davidmcinema.app.n8n.cloud/webhook/bvcc-user-id-check', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({ email })
+        });
+        
+        if (!response.ok) {
+            throw new Error(`n8n webhook returned ${response.status}`);
+        }
+        
+        const data = await response.json();
+        console.log(`User check result for ${email}:`, data);
+        
+        res.json(data);
+    } catch (error) {
+        console.error('Error checking user:', error);
+        res.status(500).json({ error: 'Failed to check user in Airtable' });
+    }
+});
+
 // Endpoint to manually clear a session (useful for testing)
 app.delete('/api/session/:sessionId', (req, res) => {
     const { sessionId } = req.params;
@@ -171,6 +208,7 @@ app.listen(PORT, () => {
     console.log(`n8n should POST to: http://localhost:${PORT}/api/callback/[sessionId]`);
     console.log(`Frontend polls: http://localhost:${PORT}/api/check-images/[sessionId]`);
     console.log(`Frontend polls regenerated: http://localhost:${PORT}/api/check-regenerated-images/[sessionId]`);
+    console.log(`BrandVoice user check: http://localhost:${PORT}/api/check-user`);
 });
 
 // Graceful shutdown
