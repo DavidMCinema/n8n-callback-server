@@ -2,7 +2,7 @@
 const express = require('express');
 const cors = require('cors');
 const bodyParser = require('body-parser');
-const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
+const stripe = require('stripe')(process.env.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);
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -176,7 +176,7 @@ app.post('/api/check-user', async (req, res) => {
 // Stripe webhook that updates Clerk user metadata
 app.post('/api/stripe-webhook-to-clerk', async (req, res) => {
     const sig = req.headers['stripe-signature'];
-    const endpointSecret = process.env.STRIPE_WEBHOOK_SECRET;
+    const endpointSecret = process.env.whsec_SgJAkR6EThNrYlSDTjTdJGFtGeg6V13l;
 
     let event;
 
@@ -278,7 +278,7 @@ app.post('/api/stripe-webhook-to-clerk', async (req, res) => {
             const clerkResponse = await fetch(`https://api.clerk.dev/v1/users/${clerkUserId}/metadata`, {
                 method: 'PATCH',
                 headers: {
-                    'Authorization': `Bearer ${process.env.CLERK_SECRET_KEY}`,
+                    'Authorization': `Bearer ${process.env.sk_test_xDrduBx4e2SxW0JG6jmkEXbdj4XT0ja5kITkQAzp3p}`,
                     'Content-Type': 'application/json'
                 },
                 body: JSON.stringify({
