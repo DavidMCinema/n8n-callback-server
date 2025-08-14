@@ -2,12 +2,17 @@
 const express = require('express');
 const cors = require('cors');
 const bodyParser = require('body-parser');
+const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
 // Enable CORS for all origins (adjust for production)
 app.use(cors());
+
+// Raw body needed for Stripe webhook signature verification
+app.use('/api/stripe-webhook-to-clerk', bodyParser.raw({type: 'application/json'}));
+
 app.use(bodyParser.json());
 app.use(bodyParser.urlencoded({ extended: true }));
 
@@ -168,6 +173,214 @@ app.post('/api/check-user', async (req, res) => {
     }
 });
 
+// Stripe webhook that updates Clerk user metadata
+app.post('/api/stripe-webhook-to-clerk', async (req, res) => {
+    const sig = req.headers['stripe-signature'];
+    const endpointSecret = process.env.STRIPE_WEBHOOK_SECRET;
+
+    let event;
+
+    try {
+        event = stripe.webhooks.constructEvent(req.body, sig, endpointSecret);
+    } catch (err) {
+        console.error('Webhook signature verification failed:', err);
+        return res.status(400).send(`Webhook Error: ${err.message}`);
+    }
+
+    // Map price IDs to tier info
+    const TIER_MAP = {
+        'price_1Rw3Am09B4tvq6CDhYHJ1Tl0': { tier: 'Essential', credits: 350, brandLimit: 1 },
+        'price_1Rw3BL09B4tvq6CDYgOfacYx': { tier: 'Growth', credits: 1050, brandLimit: 3 },
+        'price_1Rw3CB09B4tvq6CDFSp6F3pP': { tier: 'Creator', credits: 2500, brandLimit: 5 },
+        'price_1Rw3Cd09B4tvq6CDuZ9Z9x4h': { tier: 'Professional', credits: 5200, brandLimit: 7 },
+        'price_1Rw3DN09B4tvq6CDWhcrlYoc': { tier: 'Enterprise', credits: 10750, brandLimit: 10 }
+    };
+
+    try {
+        let clerkUserId;
+        let updateData = {};
+
+        switch (event.type) {
+            case 'checkout.session.completed':
+                // New subscription
+                const session = event.data.object;
+                clerkUserId = session.metadata.clerk_user_id || session.client_reference_id;
+                
+                // Get the price ID from line items
+                const expandedSession = await stripe.checkout.sessions.retrieve(session.id, {
+                    expand: ['line_items']
+                });
+                const priceId = expandedSession.line_items.data[0].price.id;
+                const tierInfo = TIER_MAP[priceId];
+
+                updateData = {
+                    stripeCustomerId: session.customer,
+                    subscriptionTier: tierInfo.tier,
+                    subscriptionStatus: 'active',
+                    creditsRemaining: tierInfo.credits,
+                    monthlyCredits: tierInfo.credits,
+                    brandLimit: tierInfo.brandLimit
+                };
+                break;
+
+            case 'customer.subscription.updated':
+                // Plan change
+                const subscription = event.data.object;
+                clerkUserId = subscription.metadata.clerk_user_id;
+                
+                const newPriceId = subscription.items.data[0].price.id;
+                const newTierInfo = TIER_MAP[newPriceId];
+
+                updateData = {
+                    subscriptionTier: newTierInfo.tier,
+                    monthlyCredits: newTierInfo.credits,
+                    brandLimit: newTierInfo.brandLimit,
+                    subscriptionStatus: subscription.status
+                };
+                break;
+
+            case 'customer.subscription.deleted':
+                // Cancellation
+                const cancelledSub = event.data.object;
+                clerkUserId = cancelledSub.metadata.clerk_user_id;
+
+                updateData = {
+                    subscriptionTier: 'Free',
+                    subscriptionStatus: 'cancelled',
+                    monthlyCredits: 0,
+                    creditsRemaining: 0,
+                    brandLimit: 1
+                };
+                break;
+
+            case 'invoice.payment_succeeded':
+                // Monthly renewal - reset credits
+                const invoice = event.data.object;
+                const subId = invoice.subscription;
+                const activeSub = await stripe.subscriptions.retrieve(subId);
+                clerkUserId = activeSub.metadata.clerk_user_id;
+                
+                const currentPriceId = activeSub.items.data[0].price.id;
+                const currentTierInfo = TIER_MAP[currentPriceId];
+
+                updateData = {
+                    creditsRemaining: currentTierInfo.credits,
+                    lastPaymentDate: new Date().toISOString()
+                };
+                break;
+        }
+
+        // Update Clerk user metadata
+        if (clerkUserId && Object.keys(updateData).length > 0) {
+            // Import fetch for Node.js < 18
+            const fetch = (...args) => import('node-fetch').then(({default: fetch}) => fetch(...args));
+            
+            const clerkResponse = await fetch(`https://api.clerk.dev/v1/users/${clerkUserId}/metadata`, {
+                method: 'PATCH',
+                headers: {
+                    'Authorization': `Bearer ${process.env.CLERK_SECRET_KEY}`,
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({
+                    public_metadata: updateData
+                })
+            });
+
+            if (!clerkResponse.ok) {
+                throw new Error(`Failed to update Clerk: ${clerkResponse.statusText}`);
+            }
+
+            console.log(`Updated Clerk user ${clerkUserId} with:`, updateData);
+        }
+
+        res.json({ received: true });
+
+    } catch (error) {
+        console.error('Error processing webhook:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// Create Stripe checkout session
+app.post('/api/create-checkout', async (req, res) => {
+    try {
+        const { priceId, customerEmail, clerkUserId, successUrl, cancelUrl } = req.body;
+
+        // IMPORTANT: Add metadata that links to Clerk
+        const session = await stripe.checkout.sessions.create({
+            payment_method_types: ['card'],
+            line_items: [{
+                price: priceId,
+                quantity: 1,
+            }],
+            mode: 'subscription',
+            success_url: successUrl,
+            cancel_url: cancelUrl,
+            customer_email: customerEmail,
+            client_reference_id: clerkUserId,
+            metadata: {
+                clerk_user_id: clerkUserId
+            },
+            subscription_data: {
+                metadata: {
+                    clerk_user_id: clerkUserId
+                }
+            }
+        });
+
+        res.json({ sessionId: session.id });
+    } catch (error) {
+        console.error('Checkout session error:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// Cancel subscription
+app.post('/api/cancel-subscription', async (req, res) => {
+    try {
+        const { customerId } = req.body;
+
+        // Get customer's subscriptions
+        const subscriptions = await stripe.subscriptions.list({
+            customer: customerId,
+            status: 'active',
+            limit: 1
+        });
+
+        if (subscriptions.data.length === 0) {
+            throw new Error('No active subscription found');
+        }
+
+        // Cancel at period end (user keeps access until end of billing period)
+        const subscription = await stripe.subscriptions.update(
+            subscriptions.data[0].id,
+            { cancel_at_period_end: true }
+        );
+
+        res.json({ success: true, subscription });
+    } catch (error) {
+        console.error('Cancel subscription error:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// Create billing portal session
+app.post('/api/create-portal-session', async (req, res) => {
+    try {
+        const { customerId, returnUrl } = req.body;
+
+        const session = await stripe.billingPortal.sessions.create({
+            customer: customerId,
+            return_url: returnUrl,
+        });
+
+        res.json({ url: session.url });
+    } catch (error) {
+        console.error('Portal session error:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
 // Endpoint to manually clear a session (useful for testing)
 app.delete('/api/session/:sessionId', (req, res) => {
     const { sessionId } = req.params;
@@ -209,6 +422,8 @@ app.listen(PORT, () => {
     console.log(`Frontend polls: http://localhost:${PORT}/api/check-images/[sessionId]`);
     console.log(`Frontend polls regenerated: http://localhost:${PORT}/api/check-regenerated-images/[sessionId]`);
     console.log(`BrandVoice user check: http://localhost:${PORT}/api/check-user`);
+    console.log(`Stripe webhook: http://localhost:${PORT}/api/stripe-webhook-to-clerk`);
+    console.log(`Create checkout: http://localhost:${PORT}/api/create-checkout`);
 });
 
 // Graceful shutdown
