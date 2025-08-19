@@ -46,13 +46,14 @@ app.get('/health', (req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
 
-// ===== n8n callback: initial/regenerated images (UNCHANGED behavior) =====
+// ===== n8n callback: initial/regenerated images (MODIFIED to accept "skipped") =====
 app.post('/api/callback/:sessionId', (req, res) => {
   const { sessionId } = req.params;
   const imageData = req.body;
   const existingSession = sessions.get(sessionId);
 
   if (existingSession && existingSession.status === 'completed') {
+    // Regeneration logic - accepts any value including "skipped"
     existingSession.hook_image_url = imageData.hook_image_url;
     existingSession.agitation_image_url = imageData.agitation_image_url;
     existingSession.solution_image_url = imageData.solution_image_url;
@@ -61,11 +62,22 @@ app.post('/api/callback/:sessionId', (req, res) => {
     existingSession.regeneratedAt = new Date().toISOString();
     sessions.set(sessionId, existingSession);
   } else {
-    if (!imageData.hook_image_url || !imageData.agitation_image_url ||
-        !imageData.solution_image_url || !imageData.cta_image_url) {
+    // MODIFIED: Accept any non-empty string including "skipped"
+    const isValidUrl = (url) => url && url !== "";
+    
+    if (!isValidUrl(imageData.hook_image_url) || 
+        !isValidUrl(imageData.agitation_image_url) ||
+        !isValidUrl(imageData.solution_image_url) || 
+        !isValidUrl(imageData.cta_image_url)) {
       return res.status(400).json({ error: 'Missing required image URLs for initial callback' });
     }
-    sessions.set(sessionId, { ...imageData, timestamp: new Date().toISOString(), status: 'completed' });
+    
+    // Create new session - "skipped" values will be stored as-is
+    sessions.set(sessionId, { 
+      ...imageData, 
+      timestamp: new Date().toISOString(), 
+      status: 'completed' 
+    });
   }
 
   // cleanup (2h)
